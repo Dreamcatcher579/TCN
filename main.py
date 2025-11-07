@@ -14,10 +14,12 @@ cfg = edict({
     'file_x': './datasetx.txt',
     'file_y': './datasety.txt',
     'input_size': 4,
-    'seq_len': 64,
+    'num_levels': 8,
+    'hidden_dim': 64,
+    'seq_len': 256,
     'epoch_size': 100,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-    'prefix': 'TCN.pth'
+    'prefix': 'TCN'
 })
 
 
@@ -40,23 +42,25 @@ class TimeSeriesDataset(Dataset):
         return torch.FloatTensor(x_seq), torch.FloatTensor([target])
 
 
-def load_dataset(x_file, y_file, seq_len=100, val_tail=20000):
+def load_dataset(x_file, y_file, seq_len=100, val_tail=25000):
     x = np.loadtxt(x_file)
     y = np.loadtxt(y_file)
 
-    mean = x.mean(axis=0)
-    std = x.std(axis=0) + 1e-8
-    x = (x - mean) / std
-
-    y_mean = y.mean(axis=0)
-    y_std = y.std(axis=0) + 1e-8
-    y = (y - y_mean) / y_std
-
     n = len(x)
-    val_tail = min(val_tail, n // 5)
+    val_tail = min(val_tail, n // 4)
 
     x_train, x_val = x[:-val_tail], x[-val_tail:]
     y_train, y_val = y[:-val_tail], y[-val_tail:]
+
+    mean = x_train.mean(axis=0)
+    std = x_train.std(axis=0) + 1e-8
+    x_train = (x_train - mean) / std
+    x_val = (x_val - mean) / std
+
+    y_mean = y_train.mean(axis=0)
+    y_std = y_train.std(axis=0) + 1e-8
+    y_train = (y_train - y_mean) / y_std
+    y_val = (y_val - y_mean) / y_std
 
     train_dataset = TimeSeriesDataset(x_train, y_train, seq_len)
     val_dataset = TimeSeriesDataset(x_val, y_val, seq_len)
@@ -68,17 +72,18 @@ if __name__ == '__main__':
     torch.manual_seed(42)
     torch.cuda.empty_cache()
     torch.backends.cuda.matmul.fp32_precision = 'tf32'
+    cfg.prefix += f"_{cfg.num_levels}_{cfg.hidden_dim}_{cfg.seq_len}.pth"
 
     train_ds, val_ds = load_dataset(cfg.file_x, cfg.file_y, cfg.seq_len)
 
     train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=64, shuffle=False)
 
-    net = TCN().to(cfg.device)
+    net = TCN(hidden_dim=cfg.hidden_dim, num_levels=cfg.num_levels).to(cfg.device)
     if os.path.isfile(cfg.prefix):
         net.load_state_dict(torch.load(cfg.prefix))
 
-    criterion = nn.MSELoss()
+    criterion = nn.SmoothL1Loss()
     optimizer = optim.Adam(net.parameters(), lr=0.001)
     scaler = amp.GradScaler()
 
@@ -114,12 +119,7 @@ if __name__ == '__main__':
                 pred = net(xb)
                 vloss = criterion(pred.squeeze(), yb.squeeze())
                 val_loss += vloss.item()
-
-                for i in range(len(yb)):
-                    if pred[i] > 0:
-                        total_score += float(yb[i])
-                    else:
-                        total_score -= float(yb[i])
+                total_score += (yb * torch.sign(pred)).sum().item()
 
         if (epoch + 1) % 10 == 0 and epoch > 0:
             torch.save(net.state_dict(), cfg.prefix)
